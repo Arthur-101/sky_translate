@@ -1,0 +1,20 @@
+# Sky Game Chat Translator - Dependencies
+
+# Image capture and processing
+Pillow
+mss
+
+# OCR
+pytesseract
+
+# Translation model
+transformers
+torch
+sentencepiece
+
+# Hotkey detection
+keyboard
+
+# Utilities
+numpy
+pyautogui
