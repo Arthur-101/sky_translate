@@ -1,4 +1,4 @@
-# Sky Game Chat Translator - Setup Guide
+# Sky Game Chat Translator - Setup Guide (v2 Overlay + Pause/Resume)
 
 ## Prerequisites
 
@@ -52,7 +52,7 @@ Before running, you need to set the correct screen coordinates for your chat pan
    - Where does the chat panel start? (left, top coordinates)
    - Where does it end? (right, bottom coordinates)
 
-4. Edit `sky_translator.py` line 24:
+4. Edit `sky_translator.py` and find `self.chat_region = (...)` inside `SkyTranslator.__init__`:
    ```python
    self.chat_region = (50, 300, 450, 700)  # Adjust these numbers
    ```
@@ -104,12 +104,13 @@ python sky_translator.py
 ## Usage
 
 1. Start the translator script
-2. Wait for "Sky Game Chat Translator v1 - Ready!" message
+2. Wait for "Sky Game Chat Translator v2 - Ready!" message
 3. Open Sky: Children of the Light
 4. Open the chat panel
-5. Press **F9** to capture and translate
-6. Check your console for translations
-7. Press **ESC** to exit
+5. Press **F9** to capture and translate (translations show in the overlay)
+6. Press **ESC** to pause/resume (this keeps the model loaded, so it resumes fast)
+7. Press **F10** to hide/show the overlay window
+8. Press **F8** to quit the program
 
 ## First Run
 
@@ -135,6 +136,10 @@ The first time you run the script:
 - Run as administrator
 - Or use a different hotkey library
 
+### Overlay doesn't appear
+- Make sure your Python installation includes `tkinter` (it usually does on Windows)
+- If `tkinter` is missing, reinstall Python with the "tcl/tk" option enabled
+
 ### Model download is slow
 - Be patient, it's a one-time download
 - Make sure you have stable internet
@@ -148,19 +153,19 @@ The first time you run the script:
 
 ## Next Steps
 
-Once v1 is working:
-- **v2**: Add overlay window (PyQt5 or tkinter)
-- **v3**: Auto-detect chat panel, continuous translation
+Once v2 is working:
+- **v3**: Auto-detect chat panel open, align translations with chat lines
 - **Future**: Support other languages (Chinese, etc.)
 
 ## File Structure
 
 ```
-sky_translator/
+sky_translate/
 │
 ├── sky_translator.py      # Main application
 ├── requirements.txt       # Python dependencies
-└── README.md             # This file
+├── find_coordinates.py    # Helper to find chat region
+└── Readme.md              # This file
 ```
 
 ## Performance Notes
@@ -192,7 +197,7 @@ Then the model will automatically use CUDA if available.
 
 3. **Testing:**
    - Save debug images to see what OCR is seeing
-   - Uncomment line 112 in sky_translator.py:
+   - Uncomment the debug save line in `sky_translator.py` (search for `debug_capture_`):
      ```python
      processed.save(f"debug_capture_{int(time.time())}.png")
      ```
