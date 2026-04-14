@@ -10,19 +10,26 @@ import sys
 import time
 import threading
 import queue
+import re
 from collections import deque
 from datetime import datetime
 
 from PIL import Image, ImageGrab, ImageEnhance, ImageOps
 import pytesseract
+from pytesseract import Output
 from transformers import MarianMTModel, MarianTokenizer
 import keyboard
-import numpy as np
+import torch
 
 try:
     import tkinter as tk
 except Exception:  # pragma: no cover (environment-specific)
     tk = None
+
+try:
+    import mss  # type: ignore
+except Exception:  # pragma: no cover
+    mss = None
 
 
 # -------------------------
@@ -41,10 +48,65 @@ OVERLAY_WIDTH_PX = 520
 OVERLAY_HEIGHT_PX = 260
 OVERLAY_WRAP_PX = 500
 OVERLAY_SHOW_RU = False
+OVERLAY_SHOW_TIMESTAMP = False
 OVERLAY_FONT = ("Segoe UI", 12)
 OVERLAY_STATUS_FONT = ("Segoe UI", 11, "bold")
 
 SEEN_CACHE_MAX = 120  # bounds memory + prevents infinite duplicate suppression
+
+USE_GPU_IF_AVAILABLE = True
+USE_FP16_IF_CUDA = True
+
+TRANSLATE_NUM_BEAMS = 2  # Balanced default
+MAX_SOURCE_TOKENS = 128
+MAX_NEW_TOKENS = 128
+
+USE_MSS = True  # faster screen capture than ImageGrab on many Windows setups
+OCR_DOWNSCALE = 1.0  # try 0.75 for speed (can reduce accuracy)
+
+MIN_OCR_CONF = 45
+MIN_CYRILLIC_LETTERS = 4
+MIN_MSG_CHARS = 3
+
+IGNORE_SPEAKERS = {"anonymous"}  # hidden players show as "... - Anonymous"
+
+_PUNCT_DOT_RE = re.compile(r"[.\u00b7\u2026\u2022\u2219\-_—–\s]+", re.UNICODE)
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+
+
+def _now_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _normalize_key(s: str) -> str:
+    return _norm_space(s).lower()
+
+
+def _cyrillic_stats(s: str):
+    total_letters = sum(ch.isalpha() for ch in s)
+    cyr = len(_CYRILLIC_RE.findall(s))
+    ratio = (cyr / total_letters) if total_letters > 0 else 0.0
+    return cyr, ratio
+
+
+def _looks_like_dots_or_junk(s: str) -> bool:
+    stripped = _PUNCT_DOT_RE.sub("", s)
+    stripped = re.sub(r"\d+", "", stripped)
+    return len(stripped) < MIN_MSG_CHARS
+
+
+def _split_speaker(line: str):
+    if " - " in line:
+        msg, speaker = line.rsplit(" - ", 1)
+        msg = _norm_space(msg)
+        speaker = _norm_space(speaker)
+        if speaker:
+            return msg, speaker
+    return _norm_space(line), ""
 
 
 class OverlayWindow:
@@ -56,6 +118,8 @@ class OverlayWindow:
         self.visible = True
         self.paused = False
         self.lines = deque(maxlen=OVERLAY_MAX_LINES)
+        self._base_status = ""
+        self._stage = ""
 
         self.root = tk.Tk()
         self.root.title("Sky Translator Overlay")
@@ -66,7 +130,7 @@ class OverlayWindow:
         # Make it look intentional and readable on top of the game.
         self.root.configure(bg="#0b0f14")
 
-        self.status_var = tk.StringVar(value="RUNNING  |  F9 capture  ESC pause  F10 hide  F8 quit")
+        self.status_var = tk.StringVar(value="")
         self.text_var = tk.StringVar(value="")
 
         self.status_label = tk.Label(
@@ -106,6 +170,8 @@ class OverlayWindow:
         self.root.bind("<ButtonPress-1>", self._on_drag_start)
         self.root.bind("<B1-Motion>", self._on_drag_move)
 
+        self.set_paused(False)
+
     def _on_drag_start(self, event):
         self._drag_x = event.x
         self._drag_y = event.y
@@ -118,9 +184,36 @@ class OverlayWindow:
     def set_paused(self, paused: bool):
         self.paused = paused
         if paused:
-            self.status_var.set("PAUSED  |  F9 resume+capture  ESC resume  F10 hide  F8 quit")
+            self._base_status = "PAUSED | F9 resume+capture  ESC resume  F10 hide  F8 quit"
         else:
-            self.status_var.set("RUNNING  |  F9 capture  ESC pause  F10 hide  F8 quit")
+            self._base_status = "RUNNING | F9 capture  ESC pause  F10 hide  F8 quit"
+        self._refresh_status()
+
+    def set_stage(self, stage: str):
+        self._stage = _norm_space(stage)
+        self._refresh_status()
+
+        # Auto-clear terminal-ish stages so the UI doesn't get stuck.
+        if (
+            self._stage.startswith("Done")
+            or self._stage.startswith("No Russian")
+            or self._stage.startswith("Busy")
+            or self._stage.startswith("Queued")
+        ):
+            current = self._stage
+
+            def _clear_if_unchanged():
+                if self._stage == current:
+                    self._stage = ""
+                    self._refresh_status()
+
+            self.root.after(1400, _clear_if_unchanged)
+
+    def _refresh_status(self):
+        if self._stage:
+            self.status_var.set(f"{self._base_status}  |  {self._stage}")
+        else:
+            self.status_var.set(self._base_status)
 
     def toggle_visibility(self):
         if self.visible:
@@ -134,48 +227,102 @@ class OverlayWindow:
         # translations: list[{"ru": str, "en": str}]
         for item in translations:
             if OVERLAY_SHOW_RU:
-                line = f"[{timestamp}] RU: {item['ru']}\n[{timestamp}] EN: {item['en']}"
+                if OVERLAY_SHOW_TIMESTAMP:
+                    line = f"[{timestamp}] RU: {item['ru']}\n[{timestamp}] EN: {item['en']}"
+                else:
+                    line = f"RU: {item['ru']}\nEN: {item['en']}"
             else:
-                line = f"[{timestamp}] {item['en']}"
+                if OVERLAY_SHOW_TIMESTAMP:
+                    line = f"[{timestamp}] {item['en']}"
+                else:
+                    line = f"{item['en']}"
             self.lines.append(line)
 
-        self.text_var.set("\n\n".join(self.lines))
+        self.text_var.set("\n".join(self.lines))
+
+    def show_note(self, note: str):
+        note = _norm_space(note)
+        if note:
+            self.text_var.set(note)
 
 
 class SkyTranslator:
     def __init__(self):
         print("Initializing Sky Game Chat Translator...")
-        
+
         # Load translation model (runs once at startup)
         print("Loading translation model (this may take a moment)...")
         model_name = "Helsinki-NLP/opus-mt-ru-en"
         self.tokenizer = MarianTokenizer.from_pretrained(model_name)
         self.model = MarianMTModel.from_pretrained(model_name)
+        self.model.eval()
+
+        self.device = torch.device("cpu")
+        if USE_GPU_IF_AVAILABLE and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        print(f"Device: {self.device}")
+
+        self.model.to(self.device)
+        if self.device.type == "cuda" and USE_FP16_IF_CUDA:
+            try:
+                self.model.half()
+                print("✓ Using FP16 on CUDA")
+            except Exception:
+                print("⚠ FP16 not supported; using FP32")
+
         print("✓ Model loaded successfully")
-        
+
         # Chat region coordinates (left side of screen)
         # You'll need to adjust these based on your screen resolution
         self.chat_region = (0, 0, 631, 934)  # (left, top, right, bottom)
-        
+
         # Store previous messages to avoid duplicates (deterministic eviction).
         self._seen_set = set()
         self._seen_order = deque()
-        
-        print("\n" + "="*60)
+
+        # Translation cache (avoids re-running the model for repeated messages).
+        self._tr_cache = {}
+        self._tr_cache_order = deque()
+        self._tr_cache_max = 256
+
+        # Optional faster capturer (falls back to ImageGrab).
+        self._sct = None
+        if USE_MSS and mss is not None:
+            try:
+                self._sct = mss.mss()
+                print("✓ Using mss for screen capture")
+            except Exception:
+                self._sct = None
+
+        print("\n" + "=" * 60)
         print("Sky Game Chat Translator v2 - Ready!")
-        print("="*60)
+        print("=" * 60)
         print(f"Chat capture region: {self.chat_region}")
         print(f"Press {CAPTURE_HOTKEY.upper()} to capture and translate chat")
         print(f"Press {PAUSE_TOGGLE_HOTKEY.upper()} to pause/resume (keeps model loaded)")
         print(f"Press {OVERLAY_TOGGLE_HOTKEY.upper()} to hide/show overlay")
         print(f"Press {QUIT_HOTKEY.upper()} to quit")
-        print("="*60 + "\n")
-    
+        print("=" * 60 + "\n")
+
     def capture_chat_region(self):
         """Capture the chat panel area of the screen"""
-        screenshot = ImageGrab.grab(bbox=self.chat_region)
-        return screenshot
-    
+        if self._sct is not None:
+            l, t, r, b = self.chat_region
+            w = max(1, int(r - l))
+            h = max(1, int(b - t))
+            monitor = {"left": int(l), "top": int(t), "width": w, "height": h}
+            shot = self._sct.grab(monitor)
+            img = Image.frombytes("RGB", shot.size, shot.rgb)
+        else:
+            img = ImageGrab.grab(bbox=self.chat_region)
+
+        if OCR_DOWNSCALE and abs(OCR_DOWNSCALE - 1.0) > 1e-3:
+            nw = max(1, int(img.size[0] * OCR_DOWNSCALE))
+            nh = max(1, int(img.size[1] * OCR_DOWNSCALE))
+            img = img.resize((nw, nh), Image.BILINEAR)
+
+        return img
+
     def preprocess_image(self, image):
         """
         Preprocess image for better OCR accuracy
@@ -185,84 +332,210 @@ class SkyTranslator:
         """
         # Convert to grayscale
         gray = ImageOps.grayscale(image)
-        
+
         # Increase contrast
         enhancer = ImageEnhance.Contrast(gray)
         contrasted = enhancer.enhance(2.0)
-        
-        # Convert to numpy array for thresholding
-        img_array = np.array(contrasted)
-        
-        # Apply binary threshold (adjust threshold value as needed)
+
+        # Apply binary threshold (PIL-native is typically faster than numpy here)
         threshold = 128
-        binary = np.where(img_array > threshold, 255, 0).astype(np.uint8)
-        
-        # Convert back to PIL Image
-        processed = Image.fromarray(binary)
-        
+        lut = [0] * (threshold + 1) + [255] * (256 - (threshold + 1))
+        processed = contrasted.point(lut)
         return processed
-    
-    def extract_text_ocr(self, image):
-        """Extract Russian text using Tesseract OCR"""
-        # Configure Tesseract for Russian
-        custom_config = r'--oem 3 --psm 6 -l rus'
-        
+
+    def _ocr_lines_data(self, image):
+        """Extract OCR words + confidences and reconstruct lines."""
+        custom_config = r"--oem 3 --psm 6 -l rus"
         try:
-            text = pytesseract.image_to_string(image, config=custom_config)
-            return text
+            data = pytesseract.image_to_data(image, config=custom_config, output_type=Output.DICT)
         except Exception as e:
             print(f"OCR Error: {e}")
-            return ""
-    
-    def clean_text(self, text):
-        """
-        Clean OCR output
-        - Keep only lines with Cyrillic characters
-        - Remove artifacts
-        - Preserve punctuation
-        """
-        if not text or text.strip() == "":
             return []
-        
-        lines = text.strip().split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            
-            # Skip empty lines
-            if not line:
+
+        grouped = {}
+        words = data.get("text", [])
+        n = len(words)
+        for i in range(n):
+            word = _norm_space(words[i])
+            if not word:
                 continue
-            
-            # Check if line contains Cyrillic characters
-            has_cyrillic = any('\u0400' <= char <= '\u04FF' for char in line)
-            
-            if has_cyrillic:
-                # Remove excessive whitespace
-                line = ' '.join(line.split())
-                cleaned_lines.append(line)
-        
-        return cleaned_lines
-    
+
+            conf_raw = (data.get("conf", ["-1"] * n)[i] or "-1").strip()
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = -1.0
+            if conf < 0:
+                continue
+
+            key = (
+                data.get("block_num", [0] * n)[i],
+                data.get("par_num", [0] * n)[i],
+                data.get("line_num", [0] * n)[i],
+            )
+
+            x = int(data.get("left", [0] * n)[i])
+            y = int(data.get("top", [0] * n)[i])
+            w = int(data.get("width", [0] * n)[i])
+            h = int(data.get("height", [0] * n)[i])
+            box = (x, y, x + w, y + h)
+
+            ent = grouped.get(key)
+            if ent is None:
+                grouped[key] = {"words": [word], "confs": [conf], "bbox": list(box)}
+            else:
+                ent["words"].append(word)
+                ent["confs"].append(conf)
+                ent["bbox"][0] = min(ent["bbox"][0], box[0])
+                ent["bbox"][1] = min(ent["bbox"][1], box[1])
+                ent["bbox"][2] = max(ent["bbox"][2], box[2])
+                ent["bbox"][3] = max(ent["bbox"][3], box[3])
+
+        lines = []
+        for _, ent in sorted(grouped.items(), key=lambda kv: kv[0]):
+            text = _norm_space(" ".join(ent["words"]))
+            if not text:
+                continue
+            avg_conf = sum(ent["confs"]) / max(1, len(ent["confs"]))
+            lines.append({"text": text, "avg_conf": avg_conf, "bbox": tuple(ent["bbox"])})
+
+        return lines
+
+    def _filter_messages(self, ocr_lines):
+        """
+        Convert OCR line candidates into message dicts:
+        - Filter low confidence, dot-only, and non-cyrillic noise (e.g. hidden '......' lines)
+        - Strip trailing speaker name ("... - Sofia") but keep it as metadata.
+        """
+        messages = []
+        for ln in ocr_lines:
+            text = ln.get("text", "")
+            avg_conf = float(ln.get("avg_conf", 0.0))
+            if avg_conf < MIN_OCR_CONF:
+                continue
+
+            msg, speaker = _split_speaker(text)
+            speaker_l = speaker.lower().strip()
+            if speaker_l and speaker_l in IGNORE_SPEAKERS:
+                continue
+
+            if not msg or len(msg) < MIN_MSG_CHARS:
+                continue
+            if _looks_like_dots_or_junk(msg):
+                continue
+
+            cyr_count, cyr_ratio = _cyrillic_stats(msg)
+            if cyr_count < MIN_CYRILLIC_LETTERS or cyr_ratio < 0.25:
+                continue
+
+            messages.append(
+                {
+                    "ru": msg,
+                    "speaker": speaker,
+                    "key": _normalize_key(msg),
+                    "avg_conf": avg_conf,
+                    "bbox": ln.get("bbox"),
+                }
+            )
+        return messages
+
     def translate_text(self, text):
         """Translate Russian text to English using MarianMT"""
         if not text:
             return ""
-        
+
         try:
             # Tokenize
-            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-            
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_SOURCE_TOKENS,
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
             # Generate translation
-            translated = self.model.generate(**inputs)
-            
+            with torch.inference_mode():
+                translated = self.model.generate(
+                    **inputs,
+                    num_beams=int(TRANSLATE_NUM_BEAMS),
+                    max_new_tokens=int(MAX_NEW_TOKENS),
+                    do_sample=False,
+                    early_stopping=True,
+                )
+
             # Decode
             translation = self.tokenizer.decode(translated[0], skip_special_tokens=True)
-            
+
             return translation
         except Exception as e:
             print(f"Translation Error: {e}")
             return f"[Translation failed: {text}]"
+
+    def _cache_get(self, key: str):
+        return self._tr_cache.get(key)
+
+    def _cache_put(self, key: str, value: str):
+        if key in self._tr_cache:
+            self._tr_cache[key] = value
+            return
+        if len(self._tr_cache_order) >= self._tr_cache_max:
+            old = self._tr_cache_order.popleft()
+            self._tr_cache.pop(old, None)
+        self._tr_cache[key] = value
+        self._tr_cache_order.append(key)
+
+    def translate_batch(self, messages):
+        """
+        Translate a list of message dicts in one batch.
+        Returns list of {"ru":..., "en":...} preserving order.
+        """
+        if not messages:
+            return []
+
+        out = [None] * len(messages)
+        to_translate = []
+        to_translate_keys = []
+        positions = []
+
+        for idx, m in enumerate(messages):
+            key = m["key"]
+            cached = self._cache_get(key)
+            if cached is not None:
+                out[idx] = {"ru": m["ru"], "en": cached}
+            else:
+                to_translate.append(m["ru"])
+                to_translate_keys.append(key)
+                positions.append(idx)
+
+        if to_translate:
+            inputs = self.tokenizer(
+                to_translate,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_SOURCE_TOKENS,
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.inference_mode():
+                generated = self.model.generate(
+                    **inputs,
+                    num_beams=int(TRANSLATE_NUM_BEAMS),
+                    max_new_tokens=int(MAX_NEW_TOKENS),
+                    do_sample=False,
+                    early_stopping=True,
+                )
+
+            decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+
+            for pos, key, ru, en in zip(positions, to_translate_keys, to_translate, decoded):
+                self._cache_put(key, en)
+                out[pos] = {"ru": ru, "en": en}
+
+        # Should be fully filled now.
+        return out
 
     def _mark_seen(self, msg: str):
         if msg in self._seen_set:
@@ -278,35 +551,76 @@ class SkyTranslator:
         return True
 
     def _dedupe_and_translate(self, cleaned_lines):
+        # Deprecated: v2 uses OCR(data) + filtering + batching for speed/quality.
         translations = []
         for russian_line in cleaned_lines:
-            if not self._mark_seen(russian_line):
+            key = _normalize_key(russian_line)
+            if not self._mark_seen(key):
                 continue
             english = self.translate_text(russian_line)
             translations.append({"ru": russian_line, "en": english})
         return translations
 
-    def process_chat_once(self):
-        """Capture → preprocess → OCR → clean → translate. Returns overlay-ready translations."""
+    def process_chat_once(self, stage_cb=None):
+        """
+        Capture → preprocess → OCR(data) → filter/dedupe → batch translate.
+        Returns (timestamp, translations, note, timings_ms).
+        """
+        timings = {}
+        t0 = _now_ms()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{timestamp}] Capturing chat...")
 
+        if stage_cb:
+            stage_cb("Capturing...")
         screenshot = self.capture_chat_region()
+        timings["capture_ms"] = _now_ms() - t0
+
+        if stage_cb:
+            stage_cb("Preprocessing...")
+        t1 = _now_ms()
         processed = self.preprocess_image(screenshot)
+        timings["preprocess_ms"] = _now_ms() - t1
 
-        print("Running OCR...")
-        raw_text = self.extract_text_ocr(processed)
-        cleaned_lines = self.clean_text(raw_text)
-        if not cleaned_lines:
-            print("⚠ No Russian text detected")
-            return timestamp, []
+        if stage_cb:
+            stage_cb("OCR...")
+        t2 = _now_ms()
+        ocr_lines = self._ocr_lines_data(processed)
+        timings["ocr_ms"] = _now_ms() - t2
 
-        print(f"✓ Found {len(cleaned_lines)} line(s) of Russian text")
-        translations = self._dedupe_and_translate(cleaned_lines)
+        if stage_cb:
+            stage_cb("Filtering...")
+        t3 = _now_ms()
+        filtered = self._filter_messages(ocr_lines)
+        # Dedupe using normalized key (after stripping speaker/spacing noise).
+        messages = [m for m in filtered if self._mark_seen(m["key"])]
+        timings["postprocess_ms"] = _now_ms() - t3
+
+        if not messages:
+            if len(filtered) > 0:
+                note = "No new Russian messages (already translated)"
+            else:
+                note = "No Russian text detected (filtered noise)"
+            timings["total_ms"] = _now_ms() - t0
+            return timestamp, [], note, timings
+
+        if stage_cb:
+            stage_cb(f"Translating ({len(messages)})...")
+        t4 = _now_ms()
+        translations = self.translate_batch(messages)
+        timings["translate_ms"] = _now_ms() - t4
+        timings["total_ms"] = _now_ms() - t0
+
+        print(
+            f"\n[{timestamp}] {len(messages)} msg(s). Timings(ms): "
+            f"cap {timings['capture_ms']:.0f}, pre {timings['preprocess_ms']:.0f}, "
+            f"ocr {timings['ocr_ms']:.0f}, post {timings['postprocess_ms']:.0f}, "
+            f"tr {timings['translate_ms']:.0f}, total {timings['total_ms']:.0f}"
+        )
         for item in translations:
             print(f"  RU: {item['ru']}")
             print(f"  EN: {item['en']}\n")
-        return timestamp, translations
+
+        return timestamp, translations, "", timings
 
 
 def _safe_put_nowait(q: queue.Queue, item):
@@ -347,9 +661,19 @@ def run_app():
                 if task != "capture":
                     continue
 
-                ts, translations = translator.process_chat_once()
-                if translations:
-                    ui_queue.put({"type": "translations", "timestamp": ts, "translations": translations})
+                def stage_cb(s: str):
+                    ui_queue.put({"type": "stage", "text": s})
+
+                ts, translations, note, timings = translator.process_chat_once(stage_cb=stage_cb)
+                ui_queue.put(
+                    {
+                        "type": "result",
+                        "timestamp": ts,
+                        "translations": translations,
+                        "note": note,
+                        "timings": timings,
+                    }
+                )
             except Exception as e:
                 ui_queue.put({"type": "log", "text": f"Error: {e}"})
                 import traceback
@@ -369,7 +693,10 @@ def run_app():
         if paused_event.is_set():
             paused_event.clear()
             ui_queue.put({"type": "status", "paused": False})
-        _safe_put_nowait(task_queue, "capture")
+        ui_queue.put({"type": "stage", "text": "Queued capture..."})
+        ok = _safe_put_nowait(task_queue, "capture")
+        if not ok:
+            ui_queue.put({"type": "stage", "text": "Busy (try again)..."})
 
     def on_pause_toggle_hotkey():
         new_paused = not paused_event.is_set()
@@ -415,8 +742,20 @@ def run_app():
             while True:
                 msg = ui_queue.get_nowait()
                 mtype = msg.get("type")
-                if mtype == "translations":
-                    overlay.push_translations(msg["timestamp"], msg["translations"])
+                if mtype == "stage":
+                    overlay.set_stage(msg.get("text", ""))
+                elif mtype == "result":
+                    translations = msg.get("translations") or []
+                    note = msg.get("note") or ""
+                    timings = msg.get("timings") or {}
+                    if translations:
+                        overlay.push_translations(msg.get("timestamp", ""), translations)
+                        overlay.set_stage(f"Done ({float(timings.get('total_ms', 0.0)):.0f}ms)")
+                    else:
+                        # Don't wipe previous translations; just show a status note.
+                        if len(overlay.lines) == 0:
+                            overlay.show_note(note or "No output")
+                        overlay.set_stage(note or "Done")
                 elif mtype == "status":
                     overlay.set_paused(bool(msg.get("paused")))
                 elif mtype == "toggle_overlay":
